@@ -3,7 +3,7 @@
 // @namespace    streamboost
 // @icon         https://image.suysker.xyz/i/2023/10/09/artworks-QOnSW1HR08BDMoe9-GJTeew-t500x500.webp
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  通用流媒体加速：加大缓冲、并发预取、内存命中、在途合并、按站点启停、修复部分站点自定义 Loader 导致的串行；当前覆盖 HLS.js，后续可扩展至其它播放器/协议。
 // @match        *://*/*
 // @run-at       document-start
@@ -99,7 +99,6 @@
       catch (e) { alert('更新失败：' + e); }
     });
 
-    // 统一菜单项文案
     const makeStatusLabel = (icon, name, on) =>
       `${icon} ${name}（当前：${on ? '启用' : '停用'}）`;
 
@@ -144,7 +143,6 @@
       let XHR   = window.XMLHttpRequest;
       let Fetch = window.fetch ? window.fetch.bind(window) : null;
       let AC    = window.AbortController;
-      // 如检测到非原生实现，尝试用隐藏 iframe 拿干净的构造器（允许失败）
       try {
         const mark = s => typeof s === 'function' && String(s).includes('[native code]');
         if (!mark(XHR) || (Fetch && !mark(Fetch)) || (AC && !mark(AC))) {
@@ -173,7 +171,7 @@
     const ENABLE_MEMCACHE = (localStorage.getItem('HLS_BIGBUF_CACHE')    ?? '1') === '1';
     const DEBUG           = (localStorage.getItem('HLS_BIGBUF_DEBUG') === '1');
 
-    // —— 预取参数（支持本地覆盖）—— //
+    // —— 预取参数 —— //
     const PREFETCH_AHEAD           = 12;
     const PREFETCH_CONC_GLOBAL     = +(localStorage.getItem('HLS_BIGBUF_CONC_GLOBAL')     || 4);
     const PREFETCH_CONC_PER_ORIGIN = +(localStorage.getItem('HLS_BIGBUF_CONC_PER_ORIGIN') || 4);
@@ -198,27 +196,60 @@
     const log  = (...a)=>{ if (DEBUG) console.log('[HLS BigBuffer]', ...a); };
     const warn = (...a)=>{ console.warn('[HLS BigBuffer]', ...a); };
 
-    // ====== LRU: url -> ArrayBuffer ======
+    // ====== ArrayBuffer 安全工具（修复点：全部走“副本”）======
+    function cloneAB(input) {
+      if (!input) return null;
+      if (input instanceof ArrayBuffer) return input.slice(0);
+      if (ArrayBuffer.isView(input)) {
+        const { buffer, byteOffset, byteLength } = input;
+        return buffer.slice(byteOffset, byteOffset + byteLength);
+      }
+      try { return new Uint8Array(input).buffer.slice(0); } catch { return null; }
+    }
+    function isDetached(buf) {
+      try {
+        return (buf instanceof ArrayBuffer) && new Uint8Array(buf).byteLength === 0;
+      } catch { return true; }
+    }
+    function abSize(buf) {
+      if (!buf) return 0;
+      if (buf instanceof ArrayBuffer) return buf.byteLength || 0;
+      if (ArrayBuffer.isView(buf))    return buf.byteLength || 0;
+      return 0;
+    }
+
+    // ====== LRU: url -> ArrayBuffer（始终保存“私有副本”，命中返回“消费副本”）======
     const prebuf = new Map();
     let prebufBytes = 0;
+
     function lruGet(url){
-      const hit = prebuf.get(url);
-      if (!hit) return null;
-      prebuf.delete(url); prebuf.set(url, hit);
-      return hit;
+      const stored = prebuf.get(url);
+      if (!stored) return null;
+      if (isDetached(stored) || abSize(stored) === 0) { // 极少见：被外界转移/损坏
+        prebuf.delete(url);
+        return null;
+      }
+      // LRU 触碰
+      prebuf.delete(url); prebuf.set(url, stored);
+      // 返回消费副本（交给 Hls.js/Worker 随便转移）
+      return cloneAB(stored);
     }
+
     function lruSet(url, buf){
-      const size = buf?.byteLength || 0;
+      const copy = cloneAB(buf);
+      const size = abSize(copy);
       if (!size || size > MAX_MEM_BYTES) return;
+
       if (prebuf.has(url)) {
-        prebufBytes -= (prebuf.get(url).byteLength || 0);
+        prebufBytes -= (abSize(prebuf.get(url)) || 0);
         prebuf.delete(url);
       }
-      prebuf.set(url, buf);
+      prebuf.set(url, copy);
       prebufBytes += size;
+
       while (prebufBytes > MAX_MEM_BYTES && prebuf.size) {
         const [k, v] = prebuf.entries().next().value;
-        prebuf.delete(k); prebufBytes -= (v.byteLength || 0);
+        prebuf.delete(k); prebufBytes -= (abSize(v) || 0);
       }
     }
     function lruHas(url){ return prebuf.has(url); }
@@ -228,7 +259,7 @@
     const inflightMeta = new Map(); // url -> { controller, level, sn, url, startedAt, origin }
     const recentFailMap= new Map();
     const floorSN      = new Map();
-    const originSlots  = new Map(); // origin -> n (我们自己的并发计数)
+    const originSlots  = new Map(); // origin -> n
 
     function takeOriginSlot(origin) {
       const cap = (origin && origin === location.origin) ? PREFETCH_CONC_GLOBAL : PREFETCH_CONC_PER_ORIGIN;
@@ -244,7 +275,7 @@
       if (DEBUG) log('slot released', origin, Math.max(0, n - 1));
     }
 
-    // ====== fLoader：命中优先/在途合并/stats 补齐 ======
+    // ====== fLoader：命中优先/在途合并/stats 补齐（修复：交付时也给副本）======
     class CacheFirstFragLoader {
       constructor(cfg){
         const Hls = window.HlsOriginal || window.Hls || window.__HlsOriginal;
@@ -291,30 +322,32 @@
             (Native.Fetch || fetch)(url, { mode:'cors', credentials:'omit', signal: ctrl.signal })
               .then(r => r.ok ? r.arrayBuffer() : Promise.reject(new Error('HTTP ' + r.status)))
               .then(buf => {
+                const out = cloneAB(buf); // 交付副本，避免后续复用同一引用
+                if (!out || abSize(out) === 0) throw new Error('buffer-clone-empty');
                 self.stats.chunkCount += 1;
-                self._markLoaded(buf.byteLength);
+                self._markLoaded(abSize(out));
                 if (ENABLE_MEMCACHE && isFrag) lruSet(url, buf);
-                callbacks.onSuccess({ url, data: buf }, self.stats, context, null);
+                callbacks.onSuccess({ url, data: out }, self.stats, context, null);
               })
               .catch(err => callbacks.onError?.({ code: 0, text: String(err) }, context, null))
               .finally(()=> clearTimeout(timer));
           }
         }
 
-        // 1) LRU 命中
+        // 1) LRU 命中（lruGet 已返回消费副本）
         if (isFrag && url) {
           const hit = lruGet(url);
-          if (hit) {
+          if (hit && abSize(hit) > 0) {
             this.stats.chunkCount += 1;
-            this._markLoaded(hit.byteLength);
+            this._markLoaded(abSize(hit));
             if (typeof callbacks.onProgress === 'function') callbacks.onProgress(this.stats, context, hit, null);
             callbacks.onSuccess({ url, data: hit }, this.stats, context, null);
-            if (DEBUG) log('fLoader cache hit', url, hit.byteLength, 'bytes');
+            if (DEBUG) log('fLoader cache hit', url, abSize(hit), 'bytes');
             return;
           }
         }
 
-        // 2) 在途合并（限时等待）
+        // 2) 在途合并（限时等待；交付副本，避免多个消费者共享同一引用）
         const p = (isFrag && url) ? inflightMap.get(url) : null;
         if (p) {
           let done = false;
@@ -323,12 +356,14 @@
             if (done) return;
             clearTimeout(timer);
             if (buf) {
+              const out = cloneAB(buf);
+              if (!out || abSize(out) === 0) { goInner(); return; }
               this.stats.chunkCount += 1;
-              this._markLoaded(buf.byteLength);
-              if (ENABLE_MEMCACHE) lruSet(url, buf);
-              callbacks.onSuccess({ url, data: buf }, this.stats, context, null);
+              this._markLoaded(abSize(out));
+              if (ENABLE_MEMCACHE && isFrag) lruSet(url, buf);
+              callbacks.onSuccess({ url, data: out }, this.stats, context, null);
               done = true;
-              if (DEBUG) log('fLoader merged in-flight prefetch', url, buf.byteLength, 'bytes');
+              if (DEBUG) log('fLoader merged in-flight prefetch', url, abSize(out), 'bytes');
             } else {
               goInner();
             }
@@ -381,7 +416,6 @@
         try {
           xhr.open('GET', url, true);
           xhr.responseType = 'arraybuffer';
-          // 让站点/播放器的 xhrSetup 有机会加 header/withCredentials
           try { hls?.config?.xhrSetup && hls.config.xhrSetup(xhr, url); } catch {}
           xhr.timeout = timeoutMs;
 
@@ -397,8 +431,8 @@
             originFailCount.set(origin, 0);
             const buf = xhr.response;
             if (ENABLE_MEMCACHE) lruSet(url, buf);
-            if (DEBUG) log('prefetch XHR ok', url, buf.byteLength, 'bytes');
-            resolve(buf);
+            if (DEBUG) log('prefetch XHR ok', url, abSize(buf), 'bytes');
+            resolve(buf); // 注意：消费者侧会 clone
           };
           xhr.onerror = function(){
             releaseOriginSlot(origin);
@@ -414,7 +448,6 @@
           };
 
           xhr.send();
-          // 保险超时兜底（部分环境 xhr.timeout 不生效）
           timer = setTimeout(()=>{ try{ xhr.abort(); }catch{} }, timeoutMs + 500);
         } catch {
           releaseOriginSlot(origin);
@@ -461,7 +494,7 @@
               originFailCount.set(origin, 0);
               const buf = resp && resp.data instanceof ArrayBuffer ? resp.data : null;
               if (buf && ENABLE_MEMCACHE) lruSet(url, buf);
-              resolve(buf);
+              resolve(buf); // 消费侧 clone
             },
             onError: () => {
               releaseOriginSlot(origin);
@@ -509,13 +542,13 @@
           if (buf) {
             originFailCount.set(origin, 0);
             if (ENABLE_MEMCACHE) lruSet(url, buf);
-            if (DEBUG) log('prefetch fetch ok', url, buf.byteLength, 'bytes');
+            if (DEBUG) log('prefetch fetch ok', url, abSize(buf), 'bytes');
           } else {
             const fc = (originFailCount.get(origin) || 0) + 1;
             originFailCount.set(origin, fc);
             if (fc >= 2) originBanUntil.set(origin, performance.now() + ORIGIN_BAN_MS);
           }
-          return buf;
+          return buf; // 消费侧 clone
         })
         .catch(() => {
           releaseOriginSlot(origin);
@@ -551,7 +584,6 @@
 
         if (inflightMap.size >= PREFETCH_CONC_GLOBAL) return null;
 
-        // 优先原生 XHR（避免被站点自定义 Loader 串行化）
         let p = prefetchWithXHR(hls, details, nf, url, origin);
         if (!p) p = prefetchWithHlsLoader(hls, details, nf, url, origin);
         if (!p) p = prefetchWithFetch(details, nf, url, origin);
